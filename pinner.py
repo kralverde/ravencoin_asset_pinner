@@ -260,9 +260,11 @@ class KuboCommunicator:
             async for chunk in self.rpc_query(get_path, 0):
                 yield chunk
         except DaemonException as e:
-            if e.message == "unexpected EOF":
+            message = json.loads(e.message)["Message"]
+
+            if message == "unexpected EOF":
                 yield b""
-            elif e.message == "this dag node is a directory":
+            elif message == "this dag node is a directory":
                 ls_path = f"api/v0/ls?arg={hash}"
 
                 acc = bytearray()
