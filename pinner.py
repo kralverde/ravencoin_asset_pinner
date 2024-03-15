@@ -262,7 +262,6 @@ class KuboCommunicator:
             async for chunk in self.rpc_query(get_path, 0):
                 yield chunk
         except DaemonException as e:
-            print(e)
             message = json.loads(e.message)["Message"]
 
             if message == "unexpected EOF":
@@ -355,7 +354,9 @@ async def get_block_for_height(daemon: DaemonCommunicator, height: int):
         raw_block = await daemon.rest_query(f"rest/block/{block_hash}.bin")
         return block_hash, raw_block
     except DaemonException as e:
-        print(e)
+        if e.status == 500:
+            print("daemon work queue exceeded: try increasing the rpc work queue")
+            return None
         error_code = json.loads(e.message)["error"]["code"]
         if error_code == -8:
             return None
@@ -468,8 +469,11 @@ async def main():
             try:
                 chain_info = await daemon.rpc_query("getblockchaininfo")
             except DaemonException as e:
-                print(e)
-                if json.loads(e.message)["error"]["code"] == -28:
+                if e.status == 401:
+                    print("Incorrect username/password")
+                    return
+                code = json.loads(e.message)["error"]["code"]
+                if code == -28:
                     print("Waiting for block index")
                     await asyncio.sleep(60)
                     continue
