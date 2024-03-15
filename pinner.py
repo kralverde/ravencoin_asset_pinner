@@ -6,7 +6,7 @@ import os
 import re
 import traceback
 
-from typing import Set, Tuple, Dict
+from typing import Optional, Set, Tuple, Dict, List
 from multiformats import CID
 
 KAWPOW_ACTIVATION_TIMESTAMP = 1588788000
@@ -20,6 +20,8 @@ CID_REGEX = re.compile(
     rb"Qm[1-9A-HJ-NP-Za-km-z]{44,}|b[A-Za-z2-7]{58,}|B[A-Z2-7]{58,}|z[1-9A-HJ-NP-Za-km-z]{48,}|F[0-9A-F]{50,}"
 )
 MAX_BLOCKS_RETRY = 60 * 2  # 2 hours
+MAX_MISSING_TO_RETRY = 5
+BLOCKS_TO_PREFETCH = 10
 
 
 class BytesReaderException(Exception):
@@ -326,36 +328,36 @@ class KuboCommunicator:
 def create_pin_task(
     ipfs_hash: str, name: str, pending_file_path: str, kubo: KuboCommunicator
 ):
-    with open(pending_file_path, "r") as f:
-        pending = dict(line.strip().split(" ") for line in f.readlines())
-    pending[ipfs_hash] = name
-    with open(pending_file_path, "w") as f:
-        f.write("\n".join(f"{ipfs_hash} {name}" for ipfs_hash, name in pending.items()))
+    add_name_to_file(name, ipfs_hash, pending_file_path)
     return asyncio.create_task(kubo.pin_hash(ipfs_hash, name))
 
 
-def remove_ipfs_hash_from_pending_file(ipfs_hash: str, pending_file_path: str):
-    with open(pending_file_path, "r") as f:
-        pending = dict(line.strip().split(" ") for line in f.readlines())
-    pending.pop(ipfs_hash, None)
-    with open(pending_file_path, "w") as f:
-        f.write("\n".join(f"{ipfs_hash} {name}" for ipfs_hash, name in pending.items()))
-
-
-def add_ipfs_hash_to_missing_file(ipfs_hash: str, name: str, missing_file_path: str):
-    with open(missing_file_path, "r") as f:
+def add_name_to_file(name: str, ipfs_hash: str, file_path: str):
+    with open(file_path, "r") as f:
         missing = dict(line.strip().split(" ") for line in f.readlines())
-    missing[ipfs_hash] = name
-    with open(missing_file_path, "w") as f:
-        f.write("\n".join(f"{ipfs_hash} {name}" for ipfs_hash, name in missing.items()))
+    missing[name] = ipfs_hash
+    with open(file_path, "w") as f:
+        f.write("\n".join(f"{name} {ipfs_hash}" for name, ipfs_hash in missing.items()))
 
 
-def remove_ipfs_hash_from_missing_file(ipfs_hash: str, missing_file_path):
-    with open(missing_file_path, "r") as f:
+def remove_name_from_file(name: str, file_path):
+    with open(file_path, "r") as f:
         missing = dict(line.strip().split(" ") for line in f.readlines())
-    missing.pop(ipfs_hash, None)
-    with open(missing_file_path, "w") as f:
-        f.write("\n".join(f"{ipfs_hash} {name}" for ipfs_hash, name in missing.items()))
+    missing.pop(name, None)
+    with open(file_path, "w") as f:
+        f.write("\n".join(f"{name} {ipfs_hash}" for name, ipfs_hash in missing.items()))
+
+
+async def get_block_for_height(daemon: DaemonCommunicator, height: int):
+    try:
+        block_hash = await daemon.rpc_query("getblockhash", height)
+        raw_block = await daemon.rest_query(f"rest/block/{block_hash}.bin")
+        return block_hash, raw_block
+    except DaemonException as e:
+        error_code = json.loads(e.message)["error"]["code"]
+        if error_code == -8:
+            return None
+        raise e
 
 
 async def main():
@@ -393,10 +395,12 @@ async def main():
         with open(missing_file, "w") as f:
             f.write("")
 
-    missing_list = list()
+    missing_list: List[Tuple[str, str]] = list()
     if os.path.exists(pending_file):
         with open(pending_file, "r") as f:
-            missing_list.extend(line.strip().split(" ") for line in f.readlines())
+            for line in f.readlines():
+                name, ipfs_hash = line.strip().split(" ")
+                missing_list.append((name, ipfs_hash))
     else:
         with open(pending_file, "w") as f:
             f.write("")
@@ -411,6 +415,9 @@ async def main():
 
     running_tasks: Set[asyncio.Task[Tuple[bool, str, str, Set[str]]]] = set()
     waiting_message_flag = False
+
+    block_tasks: Dict[int, asyncio.Task[Optional[Tuple[str, bytes]]]] = dict()
+
     while True:
         if not missing_list:
             missing_list.extend(missing.items())
@@ -433,7 +440,7 @@ async def main():
 
         for task in completed_tasks:
             successful, ipfs_hash, name, adjacent_ipfs_hashes = task.result()
-            remove_ipfs_hash_from_pending_file(ipfs_hash, pending_file)
+            remove_name_from_file(name, pending_file)
             if not successful:
                 _, created_height, _, _ = name.split("_")
                 if int(created_height) > (height - MAX_BLOCKS_RETRY):
@@ -443,10 +450,12 @@ async def main():
                 else:
                     # add to missing
                     missing[ipfs_hash] = name
-                    add_ipfs_hash_to_missing_file(ipfs_hash, name, missing_file)
+                    add_name_to_file(ipfs_hash, name, missing_file)
+
             else:
                 # remove from missing_file
-                remove_ipfs_hash_from_missing_file(ipfs_hash, missing_file)
+                remove_name_from_file(ipfs_hash, missing_file)
+
                 for ipfs_hash in adjacent_ipfs_hashes:
                     name = name.split("_")
                     name[-1] = "link"
@@ -463,15 +472,28 @@ async def main():
                     continue
                 raise e
             daemon_height = chain_info["blocks"]
-            if height < daemon_height:
-                block_hash = await daemon.rpc_query("getblockhash", height)
-                raw_block = await daemon.rest_query(f"rest/block/{block_hash}.bin")
 
+            for i in range(min(BLOCKS_TO_PREFETCH, daemon_height - height + 1)):
+                get_height = height + i
+                if get_height not in block_tasks:
+                    block_tasks[get_height] = asyncio.create_task(
+                        get_block_for_height(daemon, get_height)
+                    )
+
+            if height <= daemon_height:
+                task = block_tasks.pop(height)
+                await task
+                block = task.result()
+                if block is None:
+                    block = await get_block_for_height(daemon, height)
+                    assert block
+                block_hash, raw_block = block
                 if curr_block_hash_hex is not None:
                     prev_hash = prev_block_hash_from_block(raw_block)
                     if prev_hash.hex() != curr_block_hash_hex:
                         print("reorg detected")
                         height = max(0, height - 61)
+                        block_tasks.clear()
                         continue
 
                 for asset, asset_type, ipfs_hash in asset_info_from_block(raw_block):
@@ -483,7 +505,6 @@ async def main():
                     )
 
                     running_tasks.add(task)
-                    print(f"{asset}: {ipfs_hash} ({height})")
 
                 with open(height_file, "w") as f:
                     f.write(str(height))
@@ -491,6 +512,14 @@ async def main():
                 curr_block_hash_hex = block_hash
 
             else:
+                count = 0
+                while missing_list:
+                    count += 1
+                    if count >= MAX_MISSING_TO_RETRY:
+                        break
+                    name, ipfs_hash = missing_list.pop(0)
+                    task = create_pin_task(ipfs_hash, name, pending_file, kubo)
+                    running_tasks.add(task)
                 await asyncio.sleep(60)
         except Exception:
             traceback.print_exc()
