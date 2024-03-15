@@ -21,7 +21,8 @@ CID_REGEX = re.compile(
 )
 MAX_BLOCKS_RETRY = 60 * 2  # 2 hours
 MAX_MISSING_TO_RETRY = 5
-BLOCKS_TO_PREFETCH = 10
+BLOCKS_TO_PREFETCH = 20
+NAME_SEPERATOR = "()"
 
 
 class BytesReaderException(Exception):
@@ -286,7 +287,8 @@ class KuboCommunicator:
                             seen.add(ipfs)
                             async for chunk in self._walk_hash(ipfs, seen):
                                 yield chunk
-            raise e
+            else:
+                raise e
 
     async def pin_hash(self, hash: str, name: str):
         adjacent_ipfs_hashes: Set[str] = set()
@@ -445,7 +447,7 @@ async def main():
             successful, ipfs_hash, name, adjacent_ipfs_hashes = task.result()
             remove_name_from_file(name, pending_file)
             if not successful:
-                _, created_height, _, _ = name.split("_")
+                _, created_height, _, _ = name.split(NAME_SEPERATOR)
                 if int(created_height) > (height - MAX_BLOCKS_RETRY):
                     # immediately try to re-pin
                     task = create_pin_task(ipfs_hash, name, pending_file, kubo)
@@ -460,9 +462,9 @@ async def main():
                 remove_name_from_file(ipfs_hash, missing_file)
 
                 for ipfs_hash in adjacent_ipfs_hashes:
-                    name = name.split("_")
+                    name = name.split(NAME_SEPERATOR)
                     name[-1] = "link"
-                    name = "_".join(name)
+                    name = NAME_SEPERATOR.join(name)
                     task = create_pin_task(ipfs_hash, name, pending_file, kubo)
                     running_tasks.add(task)
         try:
@@ -506,7 +508,7 @@ async def main():
                 for asset, asset_type, ipfs_hash in asset_info_from_block(raw_block):
                     task = create_pin_task(
                         ipfs_hash,
-                        f"{asset}_{height:09}_{chr(asset_type)}_root",
+                        f"{asset}{NAME_SEPERATOR}{height:09}{NAME_SEPERATOR}{chr(asset_type)}{NAME_SEPERATOR}root",
                         pending_file,
                         kubo,
                     )
