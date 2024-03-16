@@ -19,10 +19,9 @@ WINDOW_SIZE = 128
 CID_REGEX = re.compile(
     rb"Qm[1-9A-HJ-NP-Za-km-z]{44,}|b[A-Za-z2-7]{58,}|B[A-Z2-7]{58,}|z[1-9A-HJ-NP-Za-km-z]{48,}|F[0-9A-F]{50,}"
 )
-MAX_BLOCKS_RETRY = 60 * 2  # 2 hours
+MAX_BLOCKS_QUICK_RETRY = 60 * 2  # 2 hours
 MAX_MISSING_TO_RETRY = 5
 BLOCKS_TO_PREFETCH = 20
-NAME_SEPERATOR = "()"
 
 
 class BytesReaderException(Exception):
@@ -198,7 +197,7 @@ def asset_info_from_block(b: bytes):
 
 
 class DaemonException(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status: int, message: bytes):
         self.status = status
         self.message = message
 
@@ -290,10 +289,10 @@ class KuboCommunicator:
             else:
                 raise e
 
-    async def pin_hash(self, hash: str, name: str):
+    async def pin_hash(self, hash: str, height: int):
         adjacent_ipfs_hashes: Set[str] = set()
 
-        pin_path = f"api/v0/pin/add?arg={hash}&name={name}"
+        pin_path = f"api/v0/pin/add?arg={hash}"
         try:
             async for _ in self.rpc_query(pin_path):
                 pass
@@ -316,10 +315,14 @@ class KuboCommunicator:
                     window.append(chunk.pop(0))
 
         except Exception as e:
+            if isinstance(e, DaemonException):
+                error_message = json.loads(e.message)["Message"]
+                if "pin: could not choose a decoder" in error_message:
+                    return None, hash, adjacent_ipfs_hashes, height
             if not isinstance(e, asyncio.TimeoutError):
                 traceback.print_exc()
-            return False, hash, name, adjacent_ipfs_hashes
-        return True, hash, name, adjacent_ipfs_hashes
+            return False, hash, adjacent_ipfs_hashes, height
+        return True, hash, adjacent_ipfs_hashes, height
 
     async def ping(self):
         async for _ in self.rpc_query("api/v0/id"):
@@ -328,26 +331,26 @@ class KuboCommunicator:
 
 
 def create_pin_task(
-    ipfs_hash: str, name: str, pending_file_path: str, kubo: KuboCommunicator
+    ipfs_hash: str, pending_file_path: str, kubo: KuboCommunicator, height: int
 ):
-    add_name_to_file(name, ipfs_hash, pending_file_path)
-    return asyncio.create_task(kubo.pin_hash(ipfs_hash, name))
+    add_ipfs_to_file(ipfs_hash, pending_file_path)
+    return asyncio.create_task(kubo.pin_hash(ipfs_hash, height))
 
 
-def add_name_to_file(name: str, ipfs_hash: str, file_path: str):
+def add_ipfs_to_file(ipfs_hash: str, file_path: str):
     with open(file_path, "r") as f:
-        missing = dict(line.strip().split(" ") for line in f.readlines())
-    missing[name] = ipfs_hash
+        hashes = set(line.strip() for line in f.readlines())
+    hashes.add(ipfs_hash)
     with open(file_path, "w") as f:
-        f.write("\n".join(f"{name} {ipfs_hash}" for name, ipfs_hash in missing.items()))
+        f.write("\n".join(hashes))
 
 
-def remove_name_from_file(name: str, file_path):
+def remove_ipfs_from_file(ipfs_hash: str, file_path: str):
     with open(file_path, "r") as f:
-        missing = dict(line.strip().split(" ") for line in f.readlines())
-    missing.pop(name, None)
+        hashes = set(line.strip() for line in f.readlines())
+    hashes.discard(ipfs_hash)
     with open(file_path, "w") as f:
-        f.write("\n".join(f"{name} {ipfs_hash}" for name, ipfs_hash in missing.items()))
+        f.write("\n".join(hashes))
 
 
 async def get_block_for_height(daemon: DaemonCommunicator, height: int):
@@ -394,18 +397,16 @@ async def main():
 
     if os.path.exists(missing_file):
         with open(missing_file, "r") as f:
-            missing = dict(line.strip().split(" ") for line in f.readlines())
+            missing = set(line.strip() for line in f.readlines())
     else:
-        missing: Dict[str, str] = dict()
+        missing: Set[str] = set()
         with open(missing_file, "w") as f:
             f.write("")
 
-    missing_list: List[Tuple[str, str]] = list()
+    missing_list: List[str] = list()
     if os.path.exists(pending_file):
         with open(pending_file, "r") as f:
-            for line in f.readlines():
-                name, ipfs_hash = line.strip().split(" ")
-                missing_list.append((name, ipfs_hash))
+            missing_list.extend(line.strip() for line in f.readlines())
     else:
         with open(pending_file, "w") as f:
             f.write("")
@@ -418,14 +419,14 @@ async def main():
 
     curr_block_hash_hex = None
 
-    running_tasks: Set[asyncio.Task[Tuple[bool, str, str, Set[str]]]] = set()
+    running_tasks: Set[asyncio.Task[Tuple[Optional[bool], str, Set[str], int]]] = set()
     waiting_message_flag = False
 
     block_tasks: Dict[int, asyncio.Task[Optional[Tuple[str, bytes]]]] = dict()
 
     while True:
         if not missing_list:
-            missing_list.extend(missing.items())
+            missing_list.extend(missing)
         await kubo.ping()
         completed_tasks = {task for task in running_tasks if task.done()}
         running_tasks.difference_update(completed_tasks)
@@ -445,28 +446,31 @@ async def main():
             print("Enough tasks have finished; continuing...")
 
         for task in completed_tasks:
-            successful, ipfs_hash, name, adjacent_ipfs_hashes = task.result()
-            remove_name_from_file(name, pending_file)
-            if not successful:
-                _, created_height, _, _ = name.split(NAME_SEPERATOR)
-                if int(created_height) > (height - MAX_BLOCKS_RETRY):
+            successful, ipfs_hash, adjacent_ipfs_hashes, attempt_height = task.result()
+            remove_ipfs_from_file(ipfs_hash, pending_file)
+            if successful is None:
+                # Malformed CID; just drop it
+                pass
+            elif not successful:
+                if attempt_height > (height - MAX_BLOCKS_QUICK_RETRY):
                     # immediately try to re-pin
-                    task = create_pin_task(ipfs_hash, name, pending_file, kubo)
+                    task = create_pin_task(
+                        ipfs_hash, pending_file, kubo, attempt_height
+                    )
                     running_tasks.add(task)
                 else:
                     # add to missing
-                    missing[ipfs_hash] = name
-                    add_name_to_file(ipfs_hash, name, missing_file)
+                    missing.add(ipfs_hash)
+                    add_ipfs_to_file(ipfs_hash, missing_file)
 
             else:
                 # remove from missing_file
-                remove_name_from_file(ipfs_hash, missing_file)
+                remove_ipfs_from_file(ipfs_hash, missing_file)
 
                 for ipfs_hash in adjacent_ipfs_hashes:
-                    name = name.split(NAME_SEPERATOR)
-                    name[-1] = "link"
-                    name = NAME_SEPERATOR.join(name)
-                    task = create_pin_task(ipfs_hash, name, pending_file, kubo)
+                    task = create_pin_task(
+                        ipfs_hash, pending_file, kubo, attempt_height
+                    )
                     running_tasks.add(task)
         try:
             try:
@@ -506,14 +510,8 @@ async def main():
                         block_tasks.clear()
                         continue
 
-                for asset, asset_type, ipfs_hash in asset_info_from_block(raw_block):
-                    task = create_pin_task(
-                        ipfs_hash,
-                        f"{asset}{NAME_SEPERATOR}{height:09}{NAME_SEPERATOR}{chr(asset_type)}{NAME_SEPERATOR}root",
-                        pending_file,
-                        kubo,
-                    )
-
+                for _, _, ipfs_hash in asset_info_from_block(raw_block):
+                    task = create_pin_task(ipfs_hash, pending_file, kubo, height)
                     running_tasks.add(task)
 
                 with open(height_file, "w") as f:
@@ -527,8 +525,8 @@ async def main():
                     count += 1
                     if count >= MAX_MISSING_TO_RETRY:
                         break
-                    name, ipfs_hash = missing_list.pop(0)
-                    task = create_pin_task(ipfs_hash, name, pending_file, kubo)
+                    ipfs_hash = missing_list.pop(0)
+                    task = create_pin_task(ipfs_hash, pending_file, kubo, 0)
                     running_tasks.add(task)
                 await asyncio.sleep(60)
         except Exception:
