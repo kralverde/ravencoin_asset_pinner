@@ -331,26 +331,28 @@ class KuboCommunicator:
 
 
 def create_pin_task(
-    ipfs_hash: str, pending_file_path: str, kubo: KuboCommunicator, height: int
+    ipfs_hash: str,
+    pending_file_path: str,
+    pending_set: Set[str],
+    kubo: KuboCommunicator,
+    height: int,
 ):
-    add_ipfs_to_file(ipfs_hash, pending_file_path)
+    if ipfs_hash in pending_set:
+        return None
+    add_ipfs_to_file(ipfs_hash, pending_file_path, pending_set)
     return asyncio.create_task(kubo.pin_hash(ipfs_hash, height))
 
 
-def add_ipfs_to_file(ipfs_hash: str, file_path: str):
-    with open(file_path, "r") as f:
-        hashes = set(line.strip() for line in f.readlines())
-    hashes.add(ipfs_hash)
+def add_ipfs_to_file(ipfs_hash: str, file_path: str, associated_set: Set[str]):
+    associated_set.add(ipfs_hash)
     with open(file_path, "w") as f:
-        f.write("\n".join(hashes))
+        f.write("\n".join(associated_set))
 
 
-def remove_ipfs_from_file(ipfs_hash: str, file_path: str):
-    with open(file_path, "r") as f:
-        hashes = set(line.strip() for line in f.readlines())
-    hashes.discard(ipfs_hash)
+def remove_ipfs_from_file(ipfs_hash: str, file_path: str, associated_set: Set[str]):
+    associated_set.discard(ipfs_hash)
     with open(file_path, "w") as f:
-        f.write("\n".join(hashes))
+        f.write("\n".join(associated_set))
 
 
 async def get_block_for_height(daemon: DaemonCommunicator, height: int):
@@ -397,17 +399,18 @@ async def main():
 
     if os.path.exists(missing_file):
         with open(missing_file, "r") as f:
-            missing = set(line.strip() for line in f.readlines())
+            missing_set = set(line.strip() for line in f.readlines())
     else:
-        missing: Set[str] = set()
+        missing_set: Set[str] = set()
         with open(missing_file, "w") as f:
             f.write("")
 
-    missing_list: List[str] = list()
     if os.path.exists(pending_file):
         with open(pending_file, "r") as f:
-            missing_list.extend(line.strip() for line in f.readlines())
+            pending_set = set(line.strip() for line in f.readlines())
+
     else:
+        pending_set: Set[str] = set()
         with open(pending_file, "w") as f:
             f.write("")
 
@@ -418,15 +421,20 @@ async def main():
     kubo = KuboCommunicator(kubo_url, kubo_port)
 
     curr_block_hash_hex = None
-
-    running_tasks: Set[asyncio.Task[Tuple[Optional[bool], str, Set[str], int]]] = set()
     waiting_message_flag = False
 
+    running_tasks: Set[asyncio.Task[Tuple[Optional[bool], str, Set[str], int]]] = set()
     block_tasks: Dict[int, asyncio.Task[Optional[Tuple[str, bytes]]]] = dict()
+    missing_list: List[str] = list()
+
+    for pending_hash in pending_set:
+        task = create_pin_task(pending_hash, pending_file, pending_set, kubo, height)
+        if task is not None:
+            running_tasks.add(task)
 
     while True:
         if not missing_list:
-            missing_list.extend(missing)
+            missing_list.extend(missing_set)
         await kubo.ping()
         completed_tasks = {task for task in running_tasks if task.done()}
         running_tasks.difference_update(completed_tasks)
@@ -447,31 +455,33 @@ async def main():
 
         for task in completed_tasks:
             successful, ipfs_hash, adjacent_ipfs_hashes, attempt_height = task.result()
-            remove_ipfs_from_file(ipfs_hash, pending_file)
+            remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
             if successful is None:
                 # Malformed CID; just drop it
                 pass
             elif not successful:
                 if attempt_height > (height - MAX_BLOCKS_QUICK_RETRY):
                     # immediately try to re-pin
+
                     task = create_pin_task(
-                        ipfs_hash, pending_file, kubo, attempt_height
+                        ipfs_hash, pending_file, pending_set, kubo, attempt_height
                     )
-                    running_tasks.add(task)
+                    if task is not None:
+                        running_tasks.add(task)
                 else:
                     # add to missing
-                    missing.add(ipfs_hash)
-                    add_ipfs_to_file(ipfs_hash, missing_file)
+                    add_ipfs_to_file(ipfs_hash, missing_file, missing_set)
 
             else:
                 # remove from missing_file
-                remove_ipfs_from_file(ipfs_hash, missing_file)
+                remove_ipfs_from_file(ipfs_hash, missing_file, missing_set)
 
                 for ipfs_hash in adjacent_ipfs_hashes:
                     task = create_pin_task(
-                        ipfs_hash, pending_file, kubo, attempt_height
+                        ipfs_hash, pending_file, pending_set, kubo, attempt_height
                     )
-                    running_tasks.add(task)
+                    if task is not None:
+                        running_tasks.add(task)
         try:
             try:
                 chain_info = await daemon.rpc_query("getblockchaininfo")
@@ -511,8 +521,11 @@ async def main():
                         continue
 
                 for _, _, ipfs_hash in asset_info_from_block(raw_block):
-                    task = create_pin_task(ipfs_hash, pending_file, kubo, height)
-                    running_tasks.add(task)
+                    task = create_pin_task(
+                        ipfs_hash, pending_file, pending_set, kubo, height
+                    )
+                    if task is not None:
+                        running_tasks.add(task)
 
                 with open(height_file, "w") as f:
                     f.write(str(height))
@@ -526,8 +539,12 @@ async def main():
                     if count >= MAX_MISSING_TO_RETRY:
                         break
                     ipfs_hash = missing_list.pop(0)
-                    task = create_pin_task(ipfs_hash, pending_file, kubo, 0)
-                    running_tasks.add(task)
+
+                    task = create_pin_task(
+                        ipfs_hash, pending_file, pending_set, kubo, 0
+                    )
+                    if task is not None:
+                        running_tasks.add(task)
                 await asyncio.sleep(60)
         except Exception:
             traceback.print_exc()
