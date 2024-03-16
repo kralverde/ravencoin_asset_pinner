@@ -441,6 +441,7 @@ async def main():
             completed_tasks.update(complete)
 
         if waiting_message_flag:
+            waiting_message_flag = False
             print("Enough tasks have finished; continuing...")
 
         for task in completed_tasks:
