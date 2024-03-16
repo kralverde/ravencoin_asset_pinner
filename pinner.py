@@ -448,14 +448,14 @@ async def main():
 
         for task in completed_tasks:
             successful, ipfs_hash, adjacent_ipfs_hashes, attempt_height = task.result()
-            remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
             if successful is None:
                 # Malformed CID; just drop it
-                pass
+                remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
             elif not successful:
                 if attempt_height > (height - MAX_BLOCKS_QUICK_RETRY):
                     # immediately try to re-pin
 
+                    pending_set.discard(ipfs_hash)
                     task = create_pin_task(
                         ipfs_hash, pending_file, pending_set, kubo, attempt_height
                     )
@@ -464,7 +464,7 @@ async def main():
                 else:
                     # add to missing
                     add_ipfs_to_file(ipfs_hash, missing_file, missing_set)
-
+                    remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
             else:
                 # remove from missing_file
                 remove_ipfs_from_file(ipfs_hash, missing_file, missing_set)
@@ -475,6 +475,8 @@ async def main():
                     )
                     if task is not None:
                         running_tasks.add(task)
+
+                remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
         try:
             try:
                 chain_info = await daemon.rpc_query("getblockchaininfo")
