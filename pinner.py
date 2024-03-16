@@ -113,7 +113,7 @@ def asset_info_from_script(b: bytes):
 
     asset_length = reader.read_next_u8()
     asset = reader.read(asset_length)
-    reader.read(8)  # Satoshis
+    reader.ptr += 8  # Satoshis
 
     if asset_type == 116:
         # Transfer
@@ -123,16 +123,14 @@ def asset_info_from_script(b: bytes):
                 return asset.decode(), asset_type, base58.b58encode(ipfs_hash).decode()
     elif asset_type == 113:
         # Create
-        reader.read(1)  # Divisions
-        reader.read(1)  # Reissuable
+        reader.ptr += 2  # Divisions + Reissuable
         if reader.read(1) != b"\0":
             ipfs_hash = reader.read(34)
             if ipfs_hash[:2] == b"\x12\x20":
                 return asset.decode(), asset_type, base58.b58encode(ipfs_hash).decode()
     elif asset_type == 114:
         # Reissue
-        reader.read(1)  # Divisions
-        reader.read(1)  # Reissuable
+        reader.ptr += 2  # Divisions + Reissuable
         if reader.can_read(35):
             ipfs_hash = reader.read(34)
             if ipfs_hash[:2] == b"\x12\x20":
@@ -142,42 +140,37 @@ def asset_info_from_script(b: bytes):
 
 def prev_block_hash_from_block(b: bytes):
     reader = BytesReader(b)
-    reader.read(4)
+    reader.ptr += 4
     return reader.read(32)[::-1]
 
 
 def asset_info_from_block(b: bytes):
     reader = BytesReader(b)
-    reader.read(4)  # Version
-    reader.read(32)  # Previous block hash
-    reader.read(32)  # Merkle root
+    reader.ptr += 68  # Version + Previous block hash + merkle root
     timestamp = int.from_bytes(reader.read(4), "little")
-    reader.read(4).hex()  # Bits
+    reader.ptr += 4  # Bits
 
     if timestamp < KAWPOW_ACTIVATION_TIMESTAMP:
-        reader.read(4)  # Nonce
+        reader.ptr += 4  # Nonce
     else:
-        reader.read(4)  # Height
-        reader.read(8)  # Nonce
-        reader.read(32)  # Mix hash
+        reader.ptr += 44  # Height + Nonce + Mix hash
 
     transaction_count = reader.read_var_int()
     for _ in range(transaction_count):
         has_witness = False
-        reader.read(4)  # Version
+        reader.ptr += 4  # Version
         if reader.peek_next_u8() == 0:
             assert reader.read(2) == b"\x00\x01", "Not a witness flag"
             has_witness = True
         vin_count = reader.read_var_int()
         for _ in range(vin_count):
-            reader.read(32)  # Previous txid
-            reader.read(4)  # Previous idx
+            reader.ptr += 36  # Previous txid + Previous idx
             script_length = reader.read_var_int()
             reader.read(script_length)
-            reader.read(4)  # Sequence
+            reader.ptr += 4  # Sequence
         vout_count = reader.read_var_int()
         for _ in range(vout_count):
-            reader.read(8)  # Satoshis
+            reader.ptr += 8  # Satoshis
             script_length = reader.read_var_int()
             script = reader.read(script_length)
             asset_info = asset_info_from_script(script)
@@ -190,7 +183,7 @@ def asset_info_from_block(b: bytes):
                 for _ in range(witness_count):
                     witness_length = reader.read_var_int()
                     reader.read(witness_length)
-        reader.read(4)  # Locktime
+        reader.ptr += 4  # Locktime
 
     if not reader.is_done():
         raise BytesReaderException("Leftover data")
