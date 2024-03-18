@@ -246,19 +246,24 @@ class KuboCommunicator:
                 async for chunk, _ in resp.content.iter_chunks():
                     yield chunk
 
-    async def _walk_hash(self, hash: str, seen=None):
+    async def _yield_data_from_ipfs(self, hash: str, seen: Optional[Set[str]] = None):
         if seen is None:
             seen = set()
 
+        seen.add(hash)
+
         get_path = f"api/v0/cat?arg={hash}&length={MAX_DOWNLOAD_SIZE}"
         try:
+            acc = bytearray()
             async for chunk in self.rpc_query(get_path, 0):
-                yield chunk
+                acc.extend(chunk)
+            yield acc
+
         except DaemonException as e:
             message = json.loads(e.message)["Message"]
 
             if message == "unexpected EOF":
-                yield b""
+                yield bytearray()
             elif message == "this dag node is a directory":
                 ls_path = f"api/v0/ls?arg={hash}"
 
@@ -271,13 +276,13 @@ class KuboCommunicator:
                     ipfs = obj["Hash"]
                     if ipfs not in seen:
                         seen.add(ipfs)
-                        async for chunk in self._walk_hash(ipfs, seen):
+                        async for chunk in self._yield_data_from_ipfs(ipfs, seen):
                             yield chunk
                     for link in obj["Links"]:
                         ipfs = link["Hash"]
                         if ipfs not in seen:
                             seen.add(ipfs)
-                            async for chunk in self._walk_hash(ipfs, seen):
+                            async for chunk in self._yield_data_from_ipfs(ipfs, seen):
                                 yield chunk
             else:
                 raise e
@@ -290,22 +295,14 @@ class KuboCommunicator:
             async for _ in self.rpc_query(pin_path):
                 pass
 
-            window = bytearray()
-            async for chunk in self._walk_hash(hash):
-                chunk = bytearray(chunk)
-                while len(window) < WINDOW_SIZE and len(chunk) > 0:
-                    window.append(chunk.pop(0))
-                while len(window) == WINDOW_SIZE and len(chunk) > 0:
-                    maybe_match = CID_REGEX.search(window)
-                    if maybe_match:
-                        maybe_cid = maybe_match.group().decode()
-                        try:
-                            CID.decode(maybe_cid)
-                            adjacent_ipfs_hashes.add(maybe_cid)
-                        except Exception:
-                            pass
-                    window.pop(0)
-                    window.append(chunk.pop(0))
+            async for chunk in self._yield_data_from_ipfs(hash):
+                for maybe_match in CID_REGEX.finditer(chunk):
+                    maybe_cid = maybe_match.group().decode()
+                    try:
+                        CID.decode(maybe_cid)
+                        adjacent_ipfs_hashes.add(maybe_cid)
+                    except Exception:
+                        pass
 
         except Exception as e:
             if isinstance(e, DaemonException):
@@ -400,10 +397,10 @@ async def main():
 
     if os.path.exists(pending_file):
         with open(pending_file, "r") as f:
-            pending_set = set(line.strip() for line in f.readlines())
+            pending_temp = set(line.strip() for line in f.readlines())
 
     else:
-        pending_set: Set[str] = set()
+        pending_temp: Set[str] = set()
         with open(pending_file, "w") as f:
             f.write("")
 
@@ -420,15 +417,32 @@ async def main():
     block_tasks: Dict[int, asyncio.Task[Optional[Tuple[str, bytes]]]] = dict()
     missing_list: List[str] = list()
 
-    for pending_hash in pending_set:
+    pending_set: Set[str] = set()
+    for pending_hash in pending_temp:
         task = create_pin_task(pending_hash, pending_file, pending_set, kubo, height)
         if task is not None:
             running_tasks.add(task)
+    del pending_temp
 
     while True:
         if not missing_list:
             missing_list.extend(missing_set)
         await kubo.ping()
+
+        try:
+            chain_info = await daemon.rpc_query("getblockchaininfo")
+        except DaemonException as e:
+            if e.status == 401:
+                print("Incorrect username/password")
+                return
+            code = json.loads(e.message)["error"]["code"]
+            if code == -28:
+                print("Waiting for block index")
+                await asyncio.sleep(60)
+                continue
+            raise e
+        daemon_height = chain_info["blocks"]
+
         completed_tasks = {task for task in running_tasks if task.done()}
         running_tasks.difference_update(completed_tasks)
 
@@ -452,7 +466,7 @@ async def main():
                 # Malformed CID; just drop it
                 remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
             elif not successful:
-                if attempt_height > (height - MAX_BLOCKS_QUICK_RETRY):
+                if attempt_height > (daemon_height - MAX_BLOCKS_QUICK_RETRY):
                     # immediately try to re-pin
 
                     pending_set.discard(ipfs_hash)
@@ -478,20 +492,6 @@ async def main():
 
                 remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
         try:
-            try:
-                chain_info = await daemon.rpc_query("getblockchaininfo")
-            except DaemonException as e:
-                if e.status == 401:
-                    print("Incorrect username/password")
-                    return
-                code = json.loads(e.message)["error"]["code"]
-                if code == -28:
-                    print("Waiting for block index")
-                    await asyncio.sleep(60)
-                    continue
-                raise e
-            daemon_height = chain_info["blocks"]
-
             for i in range(min(BLOCKS_TO_PREFETCH, daemon_height - height + 1)):
                 get_height = height + i
                 if get_height not in block_tasks:
@@ -530,17 +530,17 @@ async def main():
             else:
                 count = 0
                 while missing_list:
-                    count += 1
                     if count >= MAX_MISSING_TO_RETRY:
                         break
                     ipfs_hash = missing_list.pop(0)
 
                     task = create_pin_task(
-                        ipfs_hash, pending_file, pending_set, kubo, 0
+                        ipfs_hash, pending_file, pending_set, kubo, -1
                     )
                     if task is not None:
                         running_tasks.add(task)
-                await asyncio.sleep(60)
+                        count += 1
+                await asyncio.sleep(10)
         except Exception:
             traceback.print_exc()
             print("sleeping for 10 minutes")
