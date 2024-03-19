@@ -109,7 +109,7 @@ def asset_info_from_script(b: bytes):
         try:
             op_code, _ = reader.read_script()
         except BytesReaderException as e:
-            print("Failed to decode script")
+            print(e)
             print(e.print_error())
             return None
         if op_code == 0xC0:
@@ -206,7 +206,7 @@ def asset_info_from_block(b: bytes):
         reader.ptr += 4  # Locktime
 
     if not reader.is_done():
-        raise BytesReaderException("Leftover data")
+        raise BytesReaderException(reader.data, reader.ptr, "Leftover data")
 
 
 class DaemonException(Exception):
