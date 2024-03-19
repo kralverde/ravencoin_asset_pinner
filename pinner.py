@@ -25,7 +25,22 @@ BLOCKS_TO_PREFETCH = 20
 
 
 class BytesReaderException(Exception):
-    pass
+    def __init__(self, data, index, message):
+        self.data = data
+        self.index = index
+        self.message = message
+
+    def __str__(self):
+        return repr(self)
+
+    def __repr__(self):
+        return f"BytesReaderException({self.message})"
+
+    def print_error(self):
+        first = self.data[: self.index].hex()
+        ptr = self.data[self.index : self.index + 1].hex()
+        last = self.data[self.index + 1 :].hex()
+        return f"{first} | {ptr} | {last}"
 
 
 class BytesReader:
@@ -48,7 +63,9 @@ class BytesReader:
     def read(self, i: int):
         if (self.ptr + i) > len(self.data):
             raise BytesReaderException(
-                f"Out of bounds (Want: {i}, Have: {len(self.data) - self.ptr})"
+                self.data,
+                self.ptr,
+                f"Out of bounds (Want: {i}, Have: {len(self.data) - self.ptr})",
             )
         result = self.data[self.ptr : self.ptr + i]
         self.ptr += i
@@ -89,7 +106,12 @@ class BytesReader:
 def asset_info_from_script(b: bytes):
     reader = BytesReader(b)
     while not reader.is_done():
-        op_code, _ = reader.read_script()
+        try:
+            op_code, _ = reader.read_script()
+        except BytesReaderException as e:
+            print("Failed to decode script")
+            print(e.print_error())
+            return None
         if op_code == 0xC0:
             break
     else:

@@ -45,6 +45,14 @@ def test_error_case_1():
         pass
 
 
+def test_error_case_2():
+    for _ in hashes_for_block_height(1231871):
+        pass
+
+    for _ in hashes_for_block_height(1231872):
+        pass
+
+
 def test_asset():
     expected_hashes = {"QmNgcELSEQCQKi1Z9sV6rvhnjb1PGDjHhVQfmYgDTYFfr8"}
     assert not expected_hashes.symmetric_difference(hashes_for_block_height(561033))
