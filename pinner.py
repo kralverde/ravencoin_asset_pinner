@@ -10,7 +10,7 @@ from typing import Optional, Set, Tuple, Dict, List
 from multiformats import CID
 
 KAWPOW_ACTIVATION_TIMESTAMP = 1588788000
-KAWPOW_ACTIVATION_TIMESTAMP = 1585159200
+# KAWPOW_ACTIVATION_TIMESTAMP = 1585159200
 ASSET_PREFIX = b"rvn"
 MAX_TASK_SIZE = 100
 MAX_WAIT_SEC = 20 * 60
@@ -42,16 +42,14 @@ class BytesReader:
         return self.data[self.ptr]
 
     def read_next_u8(self):
-        assert self.ptr >= 0, self.ptr
-        if self.ptr >= len(self.data):
-            raise BytesReaderException("Out of bounds")
-        val = self.data[self.ptr]
-        self.ptr += 1
-        return val
+        data = self.read(1)
+        return data[0]
 
     def read(self, i: int):
         if (self.ptr + i) > len(self.data):
-            raise BytesReaderException("Out of bounds")
+            raise BytesReaderException(
+                f"Out of bounds (Want: {i}, Have: {len(self.data) - self.ptr})"
+            )
         result = self.data[self.ptr : self.ptr + i]
         self.ptr += i
         return result
