@@ -519,7 +519,7 @@ async def main():
                         get_block_for_height(daemon, get_height)
                     )
 
-            if height <= daemon_height:
+            if height < daemon_height:
                 task = block_tasks.pop(height)
                 await task
                 block = task.result()
@@ -533,6 +533,7 @@ async def main():
                         print("reorg detected")
                         height = max(0, height - 61)
                         block_tasks.clear()
+                        curr_block_hash_hex = None
                         continue
 
                 for _, _, ipfs_hash in asset_info_from_block(raw_block):
