@@ -503,9 +503,9 @@ async def main():
                 # remove from missing_file
                 remove_ipfs_from_file(ipfs_hash, missing_file, missing_set)
 
-                for ipfs_hash in adjacent_ipfs_hashes:
+                for adj_ipfs_hash in adjacent_ipfs_hashes:
                     task = create_pin_task(
-                        ipfs_hash, pending_file, pending_set, kubo, attempt_height
+                        adj_ipfs_hash, pending_file, pending_set, kubo, attempt_height
                     )
                     if task is not None:
                         running_tasks.add(task)
