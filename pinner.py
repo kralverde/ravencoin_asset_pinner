@@ -13,6 +13,8 @@ KAWPOW_ACTIVATION_TIMESTAMP = 1588788000
 # KAWPOW_ACTIVATION_TIMESTAMP = 1585159200
 ASSET_PREFIX = b"rvn"
 MAX_TASK_SIZE = 100
+RETRY_PROPORTION = 0.5
+MAX_TASK_RESTART_PROPORTION = 0.75
 MAX_WAIT_SEC = 20 * 60
 MAX_DOWNLOAD_SIZE = 1024 * 1024
 WINDOW_SIZE = 128
@@ -20,7 +22,6 @@ CID_REGEX = re.compile(
     rb"Qm[1-9A-HJ-NP-Za-km-z]{44,}|b[A-Za-z2-7]{58,}|B[A-Z2-7]{58,}|z[1-9A-HJ-NP-Za-km-z]{48,}|F[0-9A-F]{50,}"
 )
 MAX_BLOCKS_QUICK_RETRY = 60 * 2  # 2 hours
-MAX_MISSING_TO_RETRY = 5
 BLOCKS_TO_PREFETCH = 20
 
 
@@ -427,11 +428,9 @@ async def main():
     daemon = DaemonCommunicator(
         daemon_url, daemon_port, daemon_username, daemon_password
     )
-
     kubo = KuboCommunicator(kubo_url, kubo_port)
 
     curr_block_hash_hex = None
-    waiting_message_flag = False
 
     running_tasks: Set[asyncio.Task[Tuple[Optional[bool], str, Set[str], int]]] = set()
     block_tasks: Dict[int, asyncio.Task[Optional[Tuple[str, bytes]]]] = dict()
@@ -466,18 +465,14 @@ async def main():
         completed_tasks = {task for task in running_tasks if task.done()}
         running_tasks.difference_update(completed_tasks)
 
-        while len(running_tasks) > MAX_TASK_SIZE:
-            if not waiting_message_flag:
-                waiting_message_flag = True
-                print("Waiting for tasks to complete")
-            complete, pending = await asyncio.wait(
-                running_tasks, return_when=asyncio.FIRST_COMPLETED
-            )
-            running_tasks = pending
-            completed_tasks.update(complete)
-
-        if waiting_message_flag:
-            waiting_message_flag = False
+        if len(running_tasks) > MAX_TASK_SIZE:
+            print("Waiting for tasks to complete")
+            while len(running_tasks) > (MAX_TASK_RESTART_PROPORTION * MAX_TASK_SIZE):
+                complete, pending = await asyncio.wait(
+                    running_tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                running_tasks = pending
+                completed_tasks.update(complete)
             print("Enough tasks have finished; continuing...")
 
         for task in completed_tasks:
@@ -549,11 +544,10 @@ async def main():
                 curr_block_hash_hex = block_hash
 
             else:
-                count = 0
-                while missing_list and len(running_tasks) < (0.75 * MAX_TASK_SIZE):
+                while missing_list and len(running_tasks) < (
+                    RETRY_PROPORTION * MAX_TASK_SIZE
+                ):
                     # Want to leave room for new blocks
-                    if count >= MAX_MISSING_TO_RETRY:
-                        break
                     ipfs_hash = missing_list.pop(0)
 
                     task = create_pin_task(
@@ -561,7 +555,6 @@ async def main():
                     )
                     if task is not None:
                         running_tasks.add(task)
-                        count += 1
                 await asyncio.sleep(10)
         except Exception:
             traceback.print_exc()
