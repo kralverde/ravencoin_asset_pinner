@@ -550,7 +550,8 @@ async def main():
 
             else:
                 count = 0
-                while missing_list:
+                while missing_list and len(running_tasks) < (0.75 * MAX_TASK_SIZE):
+                    # Want to leave room for new blocks
                     if count >= MAX_MISSING_TO_RETRY:
                         break
                     ipfs_hash = missing_list.pop(0)
