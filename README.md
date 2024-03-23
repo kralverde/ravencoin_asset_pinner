@@ -10,5 +10,6 @@ Environment Variables:
 * `DAEMON_PASSWORD`: the rpc password.
 * `IPFS_URL`: the url/ip of the IPFS daemon. Defaults to `127.0.0.1`.
 * `IPFS_PORT`: the port of the IPFS daemon. Defaults to `5001`.
+* `DIRECTORY`: where metadata is stored. Defaults to `~/.asset_pinner`
 
 Example: `DAEMON_USERNAME=username DAEMON_PASSWORD=password python3 pinner.py`
