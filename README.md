@@ -1,1 +1,4 @@
-A script to walk the ravencoin blockchain, pinning asset CIDs to a local IFPS node as they are found.
+# Ravencoin Asset Pinner
+
+A script to walk the ravencoin blockchain, pinning asset CIDs to
+a local IFPS node as they are found.
