@@ -12,7 +12,7 @@ from multiformats import CID
 KAWPOW_ACTIVATION_TIMESTAMP = 1588788000
 # KAWPOW_ACTIVATION_TIMESTAMP = 1585159200
 ASSET_PREFIX = b"rvn"
-MAX_TASK_SIZE = 100
+MAX_TASK_SIZE = 20
 RETRY_PROPORTION = 0.5
 MAX_TASK_RESTART_PROPORTION = 0.75
 MAX_WAIT_SEC = 20 * 60
@@ -328,8 +328,12 @@ class KuboCommunicator:
         except Exception as e:
             if isinstance(e, DaemonException):
                 error_message = json.loads(e.message)["Message"]
-                if "pin: could not choose a decoder" in error_message:
-                    return None, hash, adjacent_ipfs_hashes, height
+                for chunk in (
+                    "path does not have enough components",
+                    "pin: could not choose a decoder",
+                ):
+                    if chunk in error_message:
+                        return None, hash, adjacent_ipfs_hashes, height
             if not isinstance(e, asyncio.TimeoutError):
                 traceback.print_exc()
             return False, hash, adjacent_ipfs_hashes, height
@@ -466,14 +470,14 @@ async def main():
         running_tasks.difference_update(completed_tasks)
 
         if len(running_tasks) > MAX_TASK_SIZE:
-            print("Waiting for tasks to complete")
+            print("Waiting for tasks to complete (1)")
             while len(running_tasks) > (MAX_TASK_RESTART_PROPORTION * MAX_TASK_SIZE):
                 complete, pending = await asyncio.wait(
                     running_tasks, return_when=asyncio.FIRST_COMPLETED
                 )
                 running_tasks = pending
                 completed_tasks.update(complete)
-            print("Enough tasks have finished; continuing...")
+            print("Enough tasks have finished; continuing... (1)")
 
         for task in completed_tasks:
             successful, ipfs_hash, adjacent_ipfs_hashes, attempt_height = task.result()
@@ -498,12 +502,25 @@ async def main():
                 # remove from missing_file
                 remove_ipfs_from_file(ipfs_hash, missing_file, missing_set)
 
+                print(f"pinned: {ipfs_hash}")
                 for adj_ipfs_hash in adjacent_ipfs_hashes:
                     task = create_pin_task(
                         adj_ipfs_hash, pending_file, pending_set, kubo, attempt_height
                     )
                     if task is not None:
                         running_tasks.add(task)
+
+                        if len(running_tasks) > MAX_TASK_SIZE:
+                            print("Waiting for tasks to complete (2)")
+                            while len(running_tasks) > (
+                                MAX_TASK_RESTART_PROPORTION * MAX_TASK_SIZE
+                            ):
+                                complete, pending = await asyncio.wait(
+                                    running_tasks, return_when=asyncio.FIRST_COMPLETED
+                                )
+                                running_tasks = pending
+                                completed_tasks.update(complete)
+                            print("Enough tasks have finished; continuing... (2)")
 
                 remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
         try:
