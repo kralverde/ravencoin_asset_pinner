@@ -436,15 +436,21 @@ async def main():
 
     curr_block_hash_hex = None
 
-    running_tasks: Set[asyncio.Task[Tuple[Optional[bool], str, Set[str], int]]] = set()
+    running_tasks: Dict[
+        str, asyncio.Task[Tuple[Optional[bool], str, Set[str], int]]
+    ] = dict()
     block_tasks: Dict[int, asyncio.Task[Optional[Tuple[str, bytes]]]] = dict()
     missing_list: List[str] = list()
 
     pending_set: Set[str] = set()
     for pending_hash in pending_temp:
-        task = create_pin_task(pending_hash, pending_file, pending_set, kubo, height)
-        if task is not None:
-            running_tasks.add(task)
+        if pending_hash not in running_tasks:
+            task = create_pin_task(
+                pending_hash, pending_file, pending_set, kubo, height
+            )
+            if task is not None:
+                running_tasks[pending_hash] = task
+
     del pending_temp
 
     while True:
@@ -466,20 +472,30 @@ async def main():
             raise e
         daemon_height = chain_info["blocks"]
 
-        completed_tasks = {task for task in running_tasks if task.done()}
-        running_tasks.difference_update(completed_tasks)
+        completed_tasks = {
+            hash: task for hash, task in running_tasks.items() if task.done()
+        }
+        for hash in completed_tasks.keys():
+            running_tasks.pop(hash)
 
         if len(running_tasks) > MAX_TASK_SIZE:
             print("Waiting for tasks to complete (1)")
             while len(running_tasks) > (MAX_TASK_RESTART_PROPORTION * MAX_TASK_SIZE):
-                complete, pending = await asyncio.wait(
-                    running_tasks, return_when=asyncio.FIRST_COMPLETED
+                await asyncio.wait(
+                    running_tasks.values(), return_when=asyncio.FIRST_COMPLETED
                 )
-                running_tasks = pending
-                completed_tasks.update(complete)
+
+                hashes = set()
+                for hash, task in running_tasks.items():
+                    if task.done():
+                        completed_tasks[hash] = task
+                        hashes.add(hash)
+                for hash in hashes:
+                    running_tasks.pop(hash)
+
             print("Enough tasks have finished; continuing... (1)")
 
-        for task in completed_tasks:
+        for task in completed_tasks.values():
             successful, ipfs_hash, adjacent_ipfs_hashes, attempt_height = task.result()
             if successful is None:
                 # Malformed CID; just drop it
@@ -487,13 +503,14 @@ async def main():
             elif not successful:
                 if attempt_height > (daemon_height - MAX_BLOCKS_QUICK_RETRY):
                     # immediately try to re-pin
-
+                    #
+                    # Shouldn't be any duplicate keys due to our checks
                     pending_set.discard(ipfs_hash)
                     task = create_pin_task(
                         ipfs_hash, pending_file, pending_set, kubo, attempt_height
                     )
                     if task is not None:
-                        running_tasks.add(task)
+                        running_tasks[ipfs_hash] = task
                 else:
                     # add to missing
                     add_ipfs_to_file(ipfs_hash, missing_file, missing_set)
@@ -504,23 +521,36 @@ async def main():
 
                 print(f"pinned: {ipfs_hash}")
                 for adj_ipfs_hash in adjacent_ipfs_hashes:
-                    task = create_pin_task(
-                        adj_ipfs_hash, pending_file, pending_set, kubo, attempt_height
-                    )
-                    if task is not None:
-                        running_tasks.add(task)
+                    if adj_ipfs_hash not in running_tasks:
+                        task = create_pin_task(
+                            adj_ipfs_hash,
+                            pending_file,
+                            pending_set,
+                            kubo,
+                            attempt_height,
+                        )
+                        if task is not None:
+                            running_tasks[adj_ipfs_hash] = task
 
-                        if len(running_tasks) > MAX_TASK_SIZE:
-                            print("Waiting for tasks to complete (2)")
-                            while len(running_tasks) > (
-                                MAX_TASK_RESTART_PROPORTION * MAX_TASK_SIZE
-                            ):
-                                complete, pending = await asyncio.wait(
-                                    running_tasks, return_when=asyncio.FIRST_COMPLETED
-                                )
-                                running_tasks = pending
-                                completed_tasks.update(complete)
-                            print("Enough tasks have finished; continuing... (2)")
+                            if len(running_tasks) > MAX_TASK_SIZE:
+                                print("Waiting for tasks to complete (2)")
+                                while len(running_tasks) > (
+                                    MAX_TASK_RESTART_PROPORTION * MAX_TASK_SIZE
+                                ):
+                                    await asyncio.wait(
+                                        running_tasks.values(),
+                                        return_when=asyncio.FIRST_COMPLETED,
+                                    )
+
+                                    hashes = set()
+                                    for hash, task in running_tasks.items():
+                                        if task.done():
+                                            completed_tasks[hash] = task
+                                            hashes.add(hash)
+                                    for hash in hashes:
+                                        running_tasks.pop(hash)
+
+                                print("Enough tasks have finished; continuing... (2)")
 
                 remove_ipfs_from_file(ipfs_hash, pending_file, pending_set)
         try:
@@ -549,11 +579,12 @@ async def main():
                         continue
 
                 for _, _, ipfs_hash in asset_info_from_block(raw_block):
-                    task = create_pin_task(
-                        ipfs_hash, pending_file, pending_set, kubo, height
-                    )
-                    if task is not None:
-                        running_tasks.add(task)
+                    if ipfs_hash not in running_tasks:
+                        task = create_pin_task(
+                            ipfs_hash, pending_file, pending_set, kubo, height
+                        )
+                        if task is not None:
+                            running_tasks[ipfs_hash] = task
 
                 with open(height_file, "w") as f:
                     f.write(str(height))
@@ -566,12 +597,13 @@ async def main():
                 ):
                     # Want to leave room for new blocks
                     ipfs_hash = missing_list.pop(0)
+                    if ipfs_hash not in running_tasks:
+                        task = create_pin_task(
+                            ipfs_hash, pending_file, pending_set, kubo, -1
+                        )
+                        if task is not None:
+                            running_tasks[ipfs_hash] = task
 
-                    task = create_pin_task(
-                        ipfs_hash, pending_file, pending_set, kubo, -1
-                    )
-                    if task is not None:
-                        running_tasks.add(task)
                 await asyncio.sleep(10)
         except Exception:
             traceback.print_exc()
