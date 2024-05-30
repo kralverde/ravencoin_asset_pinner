@@ -12,7 +12,7 @@ from multiformats import CID
 KAWPOW_ACTIVATION_TIMESTAMP = 1588788000
 # KAWPOW_ACTIVATION_TIMESTAMP = 1585159200
 ASSET_PREFIX = b"rvn"
-MAX_TASK_SIZE = 20
+MAX_TASK_SIZE = 50
 RETRY_PROPORTION = 0.5
 MAX_TASK_RESTART_PROPORTION = 0.75
 MAX_WAIT_SEC = 20 * 60
@@ -495,7 +495,8 @@ async def main():
 
             print("Enough tasks have finished; continuing... (1)")
 
-        for task in completed_tasks.values():
+        while completed_tasks:
+            task = completed_tasks.pop(next(k for k in completed_tasks.keys()))
             successful, ipfs_hash, adjacent_ipfs_hashes, attempt_height = task.result()
             if successful is None:
                 # Malformed CID; just drop it
